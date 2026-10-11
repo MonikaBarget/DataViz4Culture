@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+  <title>StoryScript Location Map</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/browser@0.85.1/build/stlite.css" />
+</head>
+<body>
+  <div id="root"></div>
+  <!-- Python app to run in the browser -->
+  <script type="text/x-python" id="app-code">
+"""
+StoryScript Mapper - browser version (stlite / Pyodide).
+
+This Python app helps you visualize the structure of a StoryScript repository.
+It run entirely in the user's browser.
+"""
+import asyncio
+import json
+import posixpath
+import re
+from collections import defaultdict, deque
+
+import streamlit as st
+import streamlit.components.v1 as components
+from pyodide.http import pyfetch
+
+CONTENT_KEYS = {"enemies": "Enemies", "items": "Items", "persons": "Persons", "features": "Features"}
+
+
+# ---------- GitHub access ----------
+
+def parse_url(url):
+    m = re.match(r"https?://github\.com/([^/]+)/([^/]+)/tree/([^/]+)/?(.*)", url.strip())
+    if not m:
+        raise ValueError("Please paste a URL like https://github.com/<owner>/<repo>/tree/<branch>/<folder>")
+    owner, repo, branch, path = m.groups()
+    return owner, repo, branch, path.strip("/")
+
+
+async def fetch_tree(owner, repo, branch, token):
+    headers = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    r = await pyfetch(f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}?recursive=1", headers=headers)
+    if r.status == 403:
+        raise RuntimeError("GitHub rate limit reached. Add a free GitHub token in the sidebar, or wait a bit.")
+    if r.status == 404:
+        raise RuntimeError("Repository or branch not found. Is the repo public and the branch name correct?")
+    if not r.ok:
+        raise RuntimeError(f"GitHub answered with error {r.status}.")
+    return (await r.json())["tree"]
+
+
+async def fetch_text(owner, repo, branch, path):
+    try:
+        r = await pyfetch(f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}")
+        return await r.string() if r.ok else ""
+    except Exception:
+        return ""
+
+
+# ---------- Reading TypeScript ----------
+
+def scan(src):
+    """One pass over the code. Returns (clean, masked), both the same length as src.
+    clean  = comments blanked out.
+    masked = comments blanked and string contents replaced by '_' (safe for counting brackets)."""
+    clean, masked, i, n, q = [], [], 0, len(src), None
+    while i < n:
+        c = src[i]
+        nx = src[i + 1] if i + 1 < n else ""
+        if q:
+            if c == "\\":
+                seg = src[i:i + 2]
+                clean.append(seg); masked.append("_" * len(seg)); i += 2; continue
+            clean.append(c)
+            if c == q:
+                q = None; masked.append(c)
+            else:
+                masked.append("\n" if c == "\n" else "_")
+            i += 1; continue
+        if c == "/" and nx == "/":
+            j = src.find("\n", i); j = n if j < 0 else j
+            clean.append(" " * (j - i)); masked.append(" " * (j - i)); i = j; continue
+        if c == "/" and nx == "*":
+            j = src.find("*/", i + 2); j = n if j < 0 else j + 2
+            blank = re.sub(r"[^\n]", " ", src[i:j])
+            clean.append(blank); masked.append(blank); i = j; continue
+        if c in "'\"`":
+            q = c
+        clean.append(c); masked.append(c); i += 1
+    return "".join(clean), "".join(masked)
+
+
+def find_close(masked, open_idx):
+    depth = 0
+    for i in range(open_idx, len(masked)):
+        if masked[i] in "{[(":
+            depth += 1
+        elif masked[i] in "}])":
+            depth -= 1
+            if depth == 0:
+                return i
+    return len(masked) - 1
+
+
+def top_level_props(masked, clean, start, end):
+    """Properties written directly inside an object body -> {key: (masked_value, clean_value)}."""
+    depth, keys = 0, []
+    for m in re.finditer(r"[{\[(}\])]|(?<![\w.$])([A-Za-z_]\w*)\s*:(?!:)", masked[start:end]):
+        if m.group(1) is None:
+            depth += 1 if m.group(0) in "{[(" else -1
+        elif depth == 0:
+            keys.append((m.group(1), start + m.start(), start + m.end()))
+    props = {}
+    for idx, (k, _, vs) in enumerate(keys):
+        ve = keys[idx + 1][1] if idx + 1 < len(keys) else end
+        props[k] = (masked[vs:ve].strip().rstrip(",").strip(), clean[vs:ve].strip().rstrip(",").strip())
+    return props
+
+
+def parse_imports(clean):
+    imports = {}
+    for names, path in re.findall(r"import\s*\{([^}]*)\}\s*from\s*['\"]([^'\"]+)['\"]", clean):
+        for part in names.split(","):
+            bits = part.strip().split(" as ")
+            if bits[0].strip():
+                imports[bits[-1].strip()] = (bits[0].strip(), path)
+    for name, path in re.findall(r"import\s+(\w+)\s+from\s*['\"]([^'\"]+)['\"]", clean):
+        imports[name] = (name, path)
+    return imports
+
+
+def parse_locations(text, path, all_paths):
+    clean, masked = scan(text)
+    imports = parse_imports(clean)
+    found = []
+    for m in re.finditer(r"\bLocation\s*\(\s*\{", masked):
+        open_idx = m.end() - 1
+        close = find_close(masked, open_idx)
+        fn = re.findall(r"export\s+(?:default\s+)?function\s+(\w+)", masked[:m.start()])
+        loc_id = fn[-1] if fn else posixpath.splitext(posixpath.basename(path))[0]
+        props = top_level_props(masked, clean, open_idx + 1, close)
+
+        name = loc_id
+        if "name" in props:
+            nm = re.match(r"(['\"`])(.*?)\1", props["name"][1], re.S)
+            name = nm.group(2) if nm else name
+
+        desc = props.get("description", ("", ""))[1]
+        blank_desc = desc == "" or bool(re.fullmatch(r"(['\"`])\s*\1", desc))
+        html_missing = False
+        if desc in imports and ".html" in imports[desc][1]:
+            rel = imports[desc][1].split("?")[0]
+            html_missing = posixpath.normpath(posixpath.join(posixpath.dirname(path), rel)) not in all_paths
+
+        dests = []
+        if "destinations" in props:
+            dm, dc = props["destinations"]
+            i = 0
+            while i < len(dm):
+                if dm[i] == "{":
+                    e = find_close(dm, i)
+                    p = top_level_props(dm, dc, i + 1, e)
+                    t = re.match(r"(\w+)", p["target"][0]) if "target" in p else None
+                    if t:
+                        label = re.match(r"(['\"`])(.*?)\1", p.get("name", ("", ""))[1], re.S)
+                        dests.append((imports.get(t.group(1), (t.group(1),))[0], label.group(2) if label else ""))
+                    i = e
+                i += 1
+
+        gos = sorted(set(re.findall(r"\bgo\s*\(\s*['\"`](\w+)['\"`]", clean[open_idx:close])))
+        contents = {}
+        for key in CONTENT_KEYS:
+            if key in props:
+                names = []
+                for ident in re.findall(r"[A-Za-z_]\w*", props[key][0]):
+                    if ident in imports and ident not in names:
+                        names.append(ident)
+                if names:
+                    contents[key] = names
+        found.append({"id": loc_id, "name": name, "file": path, "dests": dests, "gos": gos,
+                      "contents": contents, "html_missing": html_missing,
+                      "secondary": blank_desc and not dests and not gos})
+    return found
+
+
+async def analyse(owner, repo, branch, game_path, token):
+    tree = await fetch_tree(owner, repo, branch, token)
+    all_paths = {i["path"] for i in tree if i["type"] == "blob"}
+    ts = sorted(p for p in all_paths if p.startswith(game_path + "/") and p.endswith(".ts") and not p.endswith(".d.ts"))
+    if not ts:
+        raise RuntimeError("No .ts files found in that folder. Check the URL.")
+    texts = await asyncio.gather(*[fetch_text(owner, repo, branch, p) for p in ts])
+    locs = {}
+    for p, t in zip(ts, texts):
+        for loc in parse_locations(t, p, all_paths):
+            locs[loc["id"]] = loc
+    if not locs:
+        raise RuntimeError("No Location({...}) definitions found in that folder.")
+    return locs
+
+
+def check(locs):
+    edges, seen_pairs = [], set()
+    for i, l in locs.items():
+        for t, label in l["dests"]:
+            edges.append((i, t, label, "door")); seen_pairs.add((i, t))
+    for i, l in locs.items():
+        for t in l["gos"]:
+            if (i, t) not in seen_pairs:
+                edges.append((i, t, "", "action"))
+    adj = defaultdict(set)
+    for a, b, _, _ in edges:
+        if b in locs:
+            adj[a].add(b)
+    reach, queue = set(), deque(["Start"] if "Start" in locs else [])
+    reach.update(queue)
+    while queue:
+        for nxt in adj[queue.popleft()]:
+            if nxt not in reach:
+                reach.add(nxt); queue.append(nxt)
+    status = {}
+    for i, l in locs.items():
+        if i == "Start": status[i] = "start"
+        elif l["secondary"]: status[i] = "secondary"
+        elif "Start" in locs and i not in reach: status[i] = "unreachable"
+        elif not adj[i]: status[i] = "deadend"
+        else: status[i] = "normal"
+    unknown = [(a, b) for a, b, _, _ in edges if b not in locs]
+    return edges, status, unknown
+
+
+# Drawing the story graph
+
+STATUS_STYLE = {"start": ("#2ECC71", "star", "Start"), "normal": ("#4C9BE8", "box", "Location"),
+                "secondary": ("#CCCCCC", "ellipse", "Map-only place"),
+                "unreachable": ("#EB5757", "box", "Cannot be reached from Start"),
+                "deadend": ("#F2994A", "box", "No way out")}
+CONTENT_STYLE = {"enemies": ("#8E2F2F", "triangle"), "items": ("#E1B12C", "square"),
+                 "persons": ("#9B59B6", "dot"), "features": ("#1ABC9C", "dot")}
+
+PAGE = """<html><head><meta charset="utf-8">
+<script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/standalone/umd/vis-network.min.js"><\x2fscript>
+<style>html,body{height:100%;margin:0;font-family:sans-serif}#net{height:100%;border:1px solid #ddd;box-sizing:border-box}</style>
+</head><body><div id="net"></div><script>
+var data = __DATA__;
+var options = __OPTIONS__;
+new vis.Network(document.getElementById("net"),
+  {nodes: new vis.DataSet(data.nodes), edges: new vis.DataSet(data.edges)}, options);
+<\x2fscript></body></html>"""
+
+
+def build_graph_html(locs, edges, status, show_content, show_labels, show_secondary, tree_layout):
+    nodes, vedges, shown, content_ids = [], [], set(), set()
+    for i, l in locs.items():
+        if l["secondary"] and not show_secondary:
+            continue
+        color, shape, label = STATUS_STYLE[status[i]]
+        nid = f"loc:{i}"
+        shown.add(nid)
+        nodes.append({"id": nid, "label": l["name"], "shape": shape, "color": color,
+                      "size": 30 if shape == "star" else 20, "title": f"{l['name']} ({label})\n{l['file']}"})
+        for key in show_content:
+            for name in l["contents"].get(key, []):
+                c, s = CONTENT_STYLE[key]
+                cid = f"c:{key}:{name}"
+                if cid not in content_ids:
+                    content_ids.add(cid)
+                    nodes.append({"id": cid, "label": name, "shape": s, "color": c, "size": 9,
+                                  "title": CONTENT_KEYS[key], "font": {"size": 11}})
+                vedges.append({"from": nid, "to": cid, "color": "#dddddd", "arrows": {"to": {"enabled": False}}})
+    for a, b, label, kind in edges:
+        if f"loc:{a}" in shown and f"loc:{b}" in shown:
+            vedges.append({"from": f"loc:{a}", "to": f"loc:{b}", "arrows": "to", "dashes": kind == "action",
+                           "color": "#555555" if kind == "door" else "#999999",
+                           "label": label if show_labels else "", "font": {"size": 10},
+                           "title": label or "moves the player via an action"})
+    if tree_layout:
+        options = {"layout": {"hierarchical": {"enabled": True, "direction": "LR", "sortMethod": "directed",
+                                               "levelSeparation": 220}}, "physics": {"enabled": False},
+                   "interaction": {"hover": True}}
+    else:
+        options = {"edges": {"smooth": {"type": "curvedCW", "roundness": 0.15}},
+                   "physics": {"barnesHut": {"springLength": 160}}, "interaction": {"hover": True}}
+    safe = lambda o: json.dumps(o).replace("</", "<\\/")
+    return PAGE.replace("__DATA__", safe({"nodes": nodes, "edges": vedges})).replace("__OPTIONS__", safe(options))
+
+
+# Generate UI
+
+async def main():
+    st.set_page_config(page_title="StoryScript Location Map", layout="wide")
+    st.title("StoryScript Mapper")
+    st.write("Paste the GitHub address of a StoryScript game folder to visualize the storyline. The graph will show you locations and encounters in the game.")
+
+    with st.sidebar:
+        st.header("Show")
+        show_secondary = st.checkbox("Map-only places", True)
+        show_labels = st.checkbox("Exit names on arrows", False)
+        tree_layout = st.checkbox("Left-to-right layout", False)
+        show_content = [k for k, v in CONTENT_KEYS.items() if st.checkbox(v, k in ("enemies", "items", "persons"))]
+        token = st.text_input("GitHub token (optional)", type="password",
+                              help="Only needed if you hit GitHub's rate limit.")
+
+    url = st.text_input("GitHub URL of a game folder",
+                        "https://github.com/StrixIT/StoryScript/tree/master/src/Games/MyInteractiveMap")
+    if st.button("Visualize", type="primary"):
+        try:
+            owner, repo, branch, path = parse_url(url)
+            with st.spinner("Reading the game from GitHub…"):
+                st.session_state["locs"] = await analyse(owner, repo, branch, path, token or None)
+        except Exception as ex:
+            st.session_state.pop("locs", None)
+            st.error(str(ex))
+
+    if "locs" not in st.session_state:
+        return
+    locs = st.session_state["locs"]
+    edges, status, unknown = check(locs)
+    if "Start" not in locs:
+        st.warning("No location named 'Start' found, so reachability could not be checked.")
+
+    tab1, tab2, tab3 = st.tabs(["Map", "Checks", "All locations"])
+    with tab1:
+        st.caption("🟢 Start · 🔵 location · ⚪ map-only place · 🔴 cannot be reached · 🟠 no way out. "
+                   "Solid arrows = exits (destinations), dashed = the player is moved by an action. "
+                   "Triangles = enemies, squares = items, dots = persons/features.")
+        components.html(build_graph_html(locs, edges, status, show_content, show_labels, show_secondary,
+                                         tree_layout), height=740)
+    with tab2:
+        def names(s):
+            return [locs[i]["name"] + f" ({i})" for i in locs if status[i] == s]
+        for title, items in [("🔴 Locations that cannot be reached from Start", names("unreachable")),
+                             ("🟠 Locations with no way out", names("deadend")),
+                             ("⚠ Exits pointing to something that is not a location",
+                              [f"{a} → {b}" for a, b in unknown]),
+                             ("⚠ Description file not found",
+                              [f"{l['name']} ({l['file']})" for l in locs.values() if l["html_missing"]])]:
+            st.subheader(title)
+            st.write("\n".join(f"- {x}" for x in items) if items else "Nothing found.")
+    with tab3:
+        labels = {k: v[2] for k, v in STATUS_STYLE.items()}
+        st.dataframe([{
+            "Location": l["name"], "Id": i, "Status": labels[status[i]],
+            "Exits to": ", ".join(t for t, _ in l["dests"]),
+            "Enemies": ", ".join(l["contents"].get("enemies", [])),
+            "Items": ", ".join(l["contents"].get("items", [])),
+            "Persons": ", ".join(l["contents"].get("persons", [])),
+            "File": l["file"]} for i, l in locs.items()])
+
+
+await main()
+</script>
+  <script type="module">
+    import { mount } from "https://cdn.jsdelivr.net/npm/@stlite/browser@0.85.1/build/stlite.js";
+    mount(
+      {
+        entrypoint: "streamlit_app.py",
+        files: { "streamlit_app.py": document.getElementById("app-code").textContent },
+        streamlitConfig: { "client.toolbarMode": "viewer" },
+      },
+      document.getElementById("root"),
+    );
+  </script>
+</body>
+</html>
