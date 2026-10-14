@@ -39,6 +39,12 @@
     <a href="#" id="nav-home" class="active">Home</a>
     <div class="label">Apps</div>
     <div id="nav-apps"></div>
+    <div class="label">Contact</div>
+        <p text-size="small">Dr. Monika Barget, Maastricht University, Netherlands</p>
+        <a href="https://akademienl.social/@mob"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-mastodon" viewBox="0 0 16 16">
+  <path d="M11.19 12.195c2.016-.24 3.77-1.475 3.99-2.603.348-1.778.32-4.339.32-4.339 0-3.47-2.286-4.488-2.286-4.488C12.062.238 10.083.017 8.027 0h-.05C5.92.017 3.942.238 2.79.765c0 0-2.285 1.017-2.285 4.488l-.002.662c-.004.64-.007 1.35.011 2.091.083 3.394.626 6.74 3.78 7.57 1.454.383 2.703.463 3.709.408 1.823-.1 2.847-.647 2.847-.647l-.06-1.317s-1.303.41-2.767.36c-1.45-.05-2.98-.156-3.215-1.928a4 4 0 0 1-.033-.496s1.424.346 3.228.428c1.103.05 2.137-.064 3.188-.189zm1.613-2.47H11.13v-4.08c0-.859-.364-1.295-1.091-1.295-.804 0-1.207.517-1.207 1.541v2.233H7.168V5.89c0-1.024-.403-1.541-1.207-1.541-.727 0-1.091.436-1.091 1.296v4.079H3.197V5.522q0-1.288.66-2.046c.456-.505 1.052-.764 1.793-.764.856 0 1.504.328 1.933.983L8 4.39l.417-.695c.429-.655 1.077-.983 1.934-.983.74 0 1.336.259 1.791.764q.662.757.661 2.046z"/>
+</svg></a>
+    </div>
   </nav>
 
   <main>
@@ -49,7 +55,11 @@
          and <a href="https://stlite.net">Stlite</a>, a web assembly package that allows running the apps
          entirely in your browser. Please consider supporting the developers of these fantastic tools if you
          like what you see here!</p>
-      <p><b>When running the apps, please give them a few seconds to load and finish the necessary installations. To navigate between apps, use the menu on the left.</b></p>
+      <p>I also owe a lot to the detailed tutorials provided by Sammi Rosser on <a href="https://webapps.hsma.co.uk">HSMA - Web Apps with Streamlit</a> in July 2024, especially <a href="https://webapps.hsma.co.uk/stlite_github_pages.html">Deploying to Github Pages with Serverless Streamlit (stlite)</a>.</p>
+      <p>When running the apps, please give them a few seconds to load and finish the necessary installations. The performance of the apps depends on your network connection, so using mobile devices can slow them down. Also, be aware that while web assembly technology processes all your data in the browser and
+        does not send information to external servers, you should ideally work with sensitive data locally or in a protected research environment.</p>
+      <p>To navigate between apps, use the side-bar menu or the app buttons below. If you find any errors or have suggestions for improvement, open a <a href="https://github.com/MonikaBarget/DataViz4Culture/issues">Github issue</a>.</p>
+      
       <h2>Apps</h2>
       <div id="cards"></div>
     </section>
@@ -58,6 +68,7 @@
       <div class="bar"><a id="open-tab" href="#" target="_blank" rel="noopener">Open in own tab ↗</a></div>
       <iframe id="frame" title="App"></iframe>
     </section>
+
   </main>
 
   <script>

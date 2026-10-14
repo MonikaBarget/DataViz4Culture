@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+  <title>Calendar Analysis</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/browser@0.85.1/build/stlite.css" />
+</head>
+<body>
+  <div id="root"></div>
+  <!-- Python app to run in the browser -->
+  <script type="text/x-python" id="app-code">
+"""
+Calendar Analysis - browser version (stlite / Pyodide)
+"""
+
+import sys
+from datetime import datetime, date
+from icalendar import Calendar
+
+def to_datetime(value):
+    """Normalise ICS date/datetime values to a sortable datetime."""
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+    return datetime.min
+
+def find_events(ics_path, keyword):
+    with open(ics_path, "rb") as f:
+        cal = Calendar.from_ical(f.read())
+
+    keyword_lower = keyword.lower()
+    matches = []
+
+    for component in cal.walk("VEVENT"):
+        subject = str(component.get("summary", ""))
+        location = str(component.get("location", ""))
+        description = str(component.get("description", ""))
+
+        haystack = f"{subject} {location} {description}".lower()
+        if keyword_lower in haystack:
+            start = component.get("dtstart")
+            start_dt = to_datetime(start.dt) if start else datetime.min
+            matches.append((start_dt, subject, location))
+
+    matches.sort(key=lambda m: m[0])
+    return matches
+
+def main():
+    if len(sys.argv) < 3:
+        print("This script looks for user keywords in a <calendar.ics> file.")
+        sys.exit(1)
+
+    ics_path = sys.argv[1]
+    keyword = sys.argv[2]
+
+    matches = find_events(ics_path, keyword)
+
+    if not matches:
+        print(f"No events found matching '{keyword}'.")
+        return
+
+    print(f"{len(matches)} event(s) found matching '{keyword}':\n")
+    for start_dt, subject, location in matches:
+        when = start_dt.strftime("%Y-%m-%d %H:%M") if start_dt != datetime.min else "Unknown date"
+        loc = f" — {location}" if location else ""
+        print(f"{when}  {subject}{loc}")
+
+# Generate UI
+
+async def main():
+    st.set_page_config(page_title="Calendar Analysis", layout="wide")
+    st.title("Calendar Analysis")
+    st.markdown("This Python app is still under construction! It helps you extract calendar events by keywords from an ics file (e.g. exported from Outlook).", unsafe_allow_html=True)
+    st.markdown("In Outlook, you can export ics files by right-clicking your calendar and using the *Save Calendar* option.", unsafe_allow_html=True)
+    st.markdown("[Stlite](https://stlite.net) generates the user interface.", unsafe_allow_html=True)
+    
+    file = st.file_uploader()
+    
+if __name__ == "__main__":
+    main()
+
+</script>
+  <script type="module">
+    import { mount } from "https://cdn.jsdelivr.net/npm/@stlite/browser@0.85.1/build/stlite.js";
+    mount(
+      {
+        entrypoint: "streamlit_app.py",
+        files: { "streamlit_app.py": document.getElementById("app-code").textContent },
+        streamlitConfig: { "client.toolbarMode": "viewer",
+                         "theme.primaryColor": "#1F4E79"},
+      },
+      document.getElementById("root"),
+    );
+  </script>
+</body>
+</html>
