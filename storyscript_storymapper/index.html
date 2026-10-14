@@ -31,7 +31,7 @@ CONTENT_KEYS = {"enemies": "Enemies", "items": "Items", "persons": "Persons", "f
 def parse_url(url):
     m = re.match(r"https?://github\.com/([^/]+)/([^/]+)/tree/([^/]+)/?(.*)", url.strip())
     if not m:
-        raise ValueError("Please paste a URL like https://github.com/<owner>/<repo>/tree/<branch>/<folder>")
+        raise ValueError("Please paste a valid URL like https://github.com/<owner>/<repo>/tree/<branch>/<folder>")
     owner, repo, branch, path = m.groups()
     return owner, repo, branch, path.strip("/")
 
@@ -292,7 +292,7 @@ async def main():
     st.title("StoryScript Mapper")
     st.image("https://storyscript.nl/images/storyscript.png")
     st.markdown("This Python app helps you visualize the structure of an interactive story or game built with the JS / TS engine [StoryScript](https://storyscript.nl/demos).", unsafe_allow_html=True)
-    st.markdown("In addition to the <code>requests</code> library to access a repository URL, <code>asyncio</code>, <code>json</code>, <code>posixpath</code> for working with URL paths, <code>re</code> for regular expressions, and <code>collections</code> are used.", unsafe_allow_html=True)
+    st.markdown("In addition to the `requests` library to access a repository URL, `asyncio`, `json`, `posixpath` for working with URL paths, `re` for regular expressions, and `collections` are used.", unsafe_allow_html=True)
     st.markdown("[Stlite](https://stlite.net) generates the user interface.", unsafe_allow_html=True)
     st.markdown("Paste the GitHub address of a StoryScript game folder to visualize the storyline. The graph will show you locations and encounters in the game.")
 
