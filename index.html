@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DataViz4Culture</title>
+  <style>
+    :root { --blue:#1F4E79; --line:#d9dee3; --bg:#f6f8fa; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family: Arial, Helvetica, sans-serif; color:#222; display:flex; min-height:100vh; }
+    nav { width:260px; flex-shrink:0; background:var(--bg); border-right:1px solid var(--line);
+          padding:20px 14px; position:sticky; top:0; height:100vh; overflow-y:auto; }
+    nav h2 { font-size:1.05rem; margin:0 0 16px 6px; color:var(--blue); }
+    nav a { display:block; padding:9px 10px; margin-bottom:4px; border-radius:6px; color:#222;
+            text-decoration:none; font-size:.95rem; }
+    nav a:hover { background:#e6edf4; }
+    nav a.active { background:var(--blue); color:#fff; }
+    nav .label { font-size:.75rem; text-transform:uppercase; letter-spacing:.05em; color:#777; margin:18px 0 6px 10px; }
+    main { flex:1; min-width:0; display:flex; flex-direction:column; }
+    #home { padding:32px 40px; max-width:820px; line-height:1.6; }
+    #home h1 { color:var(--blue); margin-top:0; }
+    .card { display:block; border:1px solid var(--line); border-radius:8px; padding:14px 18px; margin:12px 0;
+            text-decoration:none; color:inherit; }
+    .card:hover { background:#f3f7fb; border-color:var(--blue); }
+    .card b { color:var(--blue); font-size:1.05rem; }
+    #viewer { display:none; flex:1; flex-direction:column; }
+    #viewer .bar { padding:8px 16px; border-bottom:1px solid var(--line); font-size:.85rem; background:#fff; }
+    #viewer iframe { flex:1; width:100%; border:0; min-height:0; }
+    @media (max-width: 720px) {
+      body { flex-direction:column; }
+      nav { width:100%; height:auto; position:static; border-right:0; border-bottom:1px solid var(--line); }
+      #home { padding:20px 16px; }
+    }
+  </style>
+</head>
+<body>
+  <nav>
+    <h2>DataViz4Culture</h2>
+    <a href="#" id="nav-home" class="active">Home</a>
+    <div class="label">Apps</div>
+    <div id="nav-apps"></div>
+  </nav>
+
+  <main>
+    <section id="home">
+      <h1>DataViz4Culture</h1>
+      <p>This repository contains small data visualization apps for cultural content &amp; humanities research.
+         The apps are built with the open-source Python framework <a href="https://streamlit.io">Streamlit</a>
+         and <a href="https://stlite.net">Stlite</a>, a web assembly package that allows running the apps
+         entirely in your browser. Please consider supporting the developers of these fantastic tools if you
+         like what you see here!</p>
+      <p><b>When running the apps, please give them a few seconds to load and finish the necessary installations. To navigate between apps, use the menu on the left.</b></p>
+      <h2>Apps</h2>
+      <div id="cards"></div>
+    </section>
+
+    <section id="viewer">
+      <div class="bar"><a id="open-tab" href="#" target="_blank" rel="noopener">Open in own tab ↗</a></div>
+      <iframe id="frame" title="App"></iframe>
+    </section>
+  </main>
+
+  <script>
+    // ---- List of apps linked in the side-bar menu ----
+    const APPS = [
+      { folder: "storyscript_storymapper", title: "StoryScript Mapper",
+        text: "Visualization app for game structures in StoryScript." },
+      // { folder: "next_app", title: "Name of the app", text: "What it does." },
+    ];
+    // ----------------------------------------------------------------------
+
+    const $ = id => document.getElementById(id);
+    const navApps = $("nav-apps"), cards = $("cards");
+
+    APPS.forEach(app => {
+      const a = document.createElement("a");
+      a.href = "#" + app.folder; a.textContent = app.title; a.dataset.folder = app.folder;
+      navApps.appendChild(a);
+      const c = document.createElement("a");
+      c.className = "card"; c.href = "#" + app.folder;
+      c.innerHTML = `<b></b><br><span></span>`;
+      c.querySelector("b").textContent = app.title; c.querySelector("span").textContent = app.text;
+      cards.appendChild(c);
+    });
+
+    function show() {
+      const folder = decodeURIComponent(location.hash.slice(1));
+      const app = APPS.find(a => a.folder === folder);
+      document.querySelectorAll("nav a").forEach(a => a.classList.remove("active"));
+      if (app) {
+        $("home").style.display = "none"; $("viewer").style.display = "flex";
+        const url = app.folder + "/";
+        if ($("frame").getAttribute("src") !== url) $("frame").src = url;
+        $("open-tab").href = url;
+        navApps.querySelector(`[data-folder="${app.folder}"]`).classList.add("active");
+      } else {
+        $("viewer").style.display = "none"; $("home").style.display = "block";
+        $("frame").removeAttribute("src");
+        $("nav-home").classList.add("active");
+      }
+    }
+    window.addEventListener("hashchange", show);
+    show();
+  </script>
+</body>
+</html>
