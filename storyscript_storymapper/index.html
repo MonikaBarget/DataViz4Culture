@@ -324,11 +324,18 @@ async def main():
 
     tab1, tab2, tab3 = st.tabs(["Map", "Checks", "All locations"])
     with tab1:
-        st.caption(" <span style="color:#2e8b57;">★</span> Start · 🔵 location · <span style="color:#d3d3d3;">●</span> map-only place · 🔴 cannot be reached · 🟠 no way out. "
-                   "Solid arrows = exits (destinations), dashed = the player is moved by an action. "
-                   "⬭ = locations, △ = enemies, □ = items, ○ = persons/features.")
-        components.html(build_graph_html(locs, edges, status, show_content, show_labels, show_secondary,
-                                         tree_layout), height=740)
+        legend = (
+            "<span style='color:#2e8b57'>★</span> Start · "
+            "<span style='color:#4C9BE8'>▬</span> location (reachable) · "
+            "<span style='color:#d3d3d3'>⬬</span> secondary location (display on map only) · "
+            "<span style='color:#EB5757'>▬</span> cannot be reached · "
+            "<span style='color:#F2994A'>▬</span> no way out. "
+            "Solid arrows = exits (destinations), dashed = the player is moved by an action. "
+            "△ = enemies, □ = items, ○ = persons/features."
+        )
+        st.markdown(f"<small>{legend}</small>", unsafe_allow_html=True)
+        components.html(build_graph_html(locs, edges, status, show_content, show_labels,
+                                         show_secondary, tree_layout), height=740)
     with tab2:
         def names(s):
             return [locs[i]["name"] + f" ({i})" for i in locs if status[i] == s]
