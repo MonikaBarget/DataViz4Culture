@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
-  <title>StoryScript Location Map</title>
+  <title>StoryScript Mapper</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/browser@0.85.1/build/stlite.css" />
 </head>
 <body>
@@ -29,8 +29,8 @@ from pyodide.http import pyfetch
 CONTENT_KEYS = {"enemies": "Enemies", "items": "Items", "persons": "Persons", "features": "Features"}
 
 
-# ---------- GitHub access ----------
-
+# GitHub access
+    
 def parse_url(url):
     m = re.match(r"https?://github\.com/([^/]+)/([^/]+)/tree/([^/]+)/?(.*)", url.strip())
     if not m:
@@ -52,7 +52,6 @@ async def fetch_tree(owner, repo, branch, token):
         raise RuntimeError(f"GitHub answered with error {r.status}.")
     return (await r.json())["tree"]
 
-
 async def fetch_text(owner, repo, branch, path):
     try:
         r = await pyfetch(f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}")
@@ -61,7 +60,7 @@ async def fetch_text(owner, repo, branch, path):
         return ""
 
 
-# ---------- Reading TypeScript ----------
+# Reading TypeScript
 
 def scan(src):
     """One pass over the code. Returns (clean, masked), both the same length as src.
@@ -325,9 +324,9 @@ async def main():
 
     tab1, tab2, tab3 = st.tabs(["Map", "Checks", "All locations"])
     with tab1:
-        st.caption("🟢 Start · 🔵 location · ⚪ map-only place · 🔴 cannot be reached · 🟠 no way out. "
+        st.caption(" <span style="color:#2e8b57;">★</span> Start · 🔵 location · <span style="color:#d3d3d3;">●</span> map-only place · 🔴 cannot be reached · 🟠 no way out. "
                    "Solid arrows = exits (destinations), dashed = the player is moved by an action. "
-                   "Triangles = enemies, squares = items, dots = persons/features.")
+                   "⬭ = locations, △ = enemies, □ = items, ○ = persons/features.")
         components.html(build_graph_html(locs, edges, status, show_content, show_labels, show_secondary,
                                          tree_layout), height=740)
     with tab2:
