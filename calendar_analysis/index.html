@@ -8,88 +8,181 @@
 </head>
 <body>
   <div id="root"></div>
+
   <!-- Python app to run in the browser -->
   <script type="text/x-python" id="app-code">
+    
 """
 Calendar Analysis - browser version (stlite / Pyodide)
 """
-
-import sys
+# Import of packages needed
+    
 from datetime import datetime, date
+
+import pandas as pd
+import streamlit as st
 from icalendar import Calendar
 
+# Create app layout
+
+st.set_page_config(page_title="Calendar Analysis", layout="wide")
+
+# Define functions for analysis of ics information
+
 def to_datetime(value):
-    """Normalise ICS date/datetime values to a sortable datetime."""
+    """Normalise ICS date/datetime values. None if missing."""
     if isinstance(value, datetime):
         return value.replace(tzinfo=None)
     if isinstance(value, date):
         return datetime(value.year, value.month, value.day)
-    return datetime.min
+    return None
 
-def find_events(ics_path, keyword):
-    with open(ics_path, "rb") as f:
-        cal = Calendar.from_ical(f.read())
+def is_all_day(value):
+    return isinstance(value, date) and not isinstance(value, datetime)
 
-    keyword_lower = keyword.lower()
-    matches = []
+def find_events(ics_bytes, filename, keywords, search_description, match_all):
+    cal = Calendar.from_ical(ics_bytes)
+    rows = []
 
     for component in cal.walk("VEVENT"):
         subject = str(component.get("summary", ""))
         location = str(component.get("location", ""))
         description = str(component.get("description", ""))
 
-        haystack = f"{subject} {location} {description}".lower()
-        if keyword_lower in haystack:
-            start = component.get("dtstart")
-            start_dt = to_datetime(start.dt) if start else datetime.min
-            matches.append((start_dt, subject, location))
+        parts = [subject, location]
+        if search_description:
+            parts.append(description)
+        haystack = " ".join(parts).lower()
 
-    matches.sort(key=lambda m: m[0])
-    return matches
-
-def main():
-    if len(sys.argv) < 3:
-        print("This script looks for user keywords in a <calendar.ics> file.")
-        sys.exit(1)
-
-    ics_path = sys.argv[1]
-    keyword = sys.argv[2]
-
-    matches = find_events(ics_path, keyword)
-
-    if not matches:
-        print(f"No events found matching '{keyword}'.")
-        return
-
-    print(f"{len(matches)} event(s) found matching '{keyword}':\n")
-    for start_dt, subject, location in matches:
-        when = start_dt.strftime("%Y-%m-%d %H:%M") if start_dt != datetime.min else "Unknown date"
-        loc = f" — {location}" if location else ""
-        print(f"{when}  {subject}{loc}")
+        checks = [k in haystack for k in keywords]
+        if not keywords or (all(checks) if match_all else any(checks)):
+            start_raw = component.get("dtstart")
+            end_raw = component.get("dtend")
+            start_val = start_raw.dt if start_raw else None
+            end_val = end_raw.dt if end_raw else None
+            rows.append(
+                {
+                    "Start": to_datetime(start_val),
+                    "End": to_datetime(end_val),
+                    "All day": is_all_day(start_val),
+                    "Event": subject,
+                    "Location": location,
+                    "File": filename,
+                }
+            )
+    return rows
 
 # Generate UI
 
-async def main():
-    st.set_page_config(page_title="Calendar Analysis", layout="wide")
-    st.title("Calendar Analysis")
-    st.markdown("This Python app is still under construction! It helps you extract calendar events by keywords from an ics file (e.g. exported from Outlook).", unsafe_allow_html=True)
-    st.markdown("In Outlook, you can export ics files by right-clicking your calendar and using the *Save Calendar* option.", unsafe_allow_html=True)
-    st.markdown("[Stlite](https://stlite.net) generates the user interface.", unsafe_allow_html=True)
-    
-    file = st.file_uploader()
-    
-if __name__ == "__main__":
-    main()
+st.title("Calendar Analysis")
+st.markdown(
+    "This is an app to extract calendar events by keyword from one or more `.ics` files "
+    "(e.g. exported from Outlook or Google). Your files are processed in your browser "
+    "and are not uploaded anywhere. However, sensitive data should always be processed locally. "
+    "This app is still under construction."
+)
+st.markdown(
+    "In Outlook, right-click your calendar and choose *Save Calendar* to export an `.ics` file."
+)
 
-</script>
+with st.sidebar:
+    st.header("Search settings")
+    keyword_text = st.text_input(
+        "Keyword(s)",
+        placeholder="e.g. workshop, review",
+        help="Separate multiple keywords with commas. Leave empty to list all events.",
+    )
+    match_all = st.radio(
+        "When using several keywords",
+        ["Match any keyword", "Match all keywords"],
+    ) == "Match all keywords"
+    search_description = st.checkbox(
+        "Also search event descriptions", value=True,
+        help="Event name and location are always searched.",
+    )
+    use_dates = st.checkbox("Limit to a date range")
+    if use_dates:
+        today = date.today()
+        date_range = st.date_input("Date range", value=(date(today.year, 1, 1), today))
+
+uploads = st.file_uploader(
+    "Upload one or more calendar files",
+    type=["ics"],
+    accept_multiple_files=True,
+)
+
+if not uploads:
+    st.info("Upload an .ics file to get started.")
+    st.stop()
+
+keywords = [k.strip().lower() for k in keyword_text.split(",") if k.strip()]
+
+all_rows = []
+for up in uploads:
+    try:
+        all_rows += find_events(up.getvalue(), up.name, keywords, search_description, match_all)
+    except Exception as exc:
+        st.error(f"Could not read **{up.name}**: {exc}")
+
+if not all_rows:
+    st.warning("No events found." if not keywords else f"No events found matching: {', '.join(keywords)}")
+    st.stop()
+
+df = pd.DataFrame(all_rows)
+
+if use_dates and isinstance(date_range, (tuple, list)) and len(date_range) == 2:
+    d0, d1 = date_range
+    mask = df["Start"].notna() & (df["Start"].dt.date >= d0) & (df["Start"].dt.date <= d1)
+    df = df[mask]
+
+df = df.sort_values("Start", na_position="last").reset_index(drop=True)
+
+if df.empty:
+    st.warning("No events found in the selected date range.")
+    st.stop()
+
+# Display / export table: Start shown as date only for all-day events
+    
+def fmt(ts, all_day):
+    if pd.isna(ts):
+        return "Unknown date"
+    return ts.strftime("%Y-%m-%d") if all_day else ts.strftime("%Y-%m-%d %H:%M")
+
+out = pd.DataFrame(
+    {
+        "Start": [fmt(s, a) for s, a in zip(df["Start"], df["All day"])],
+        "End": [fmt(e, a) if pd.notna(e) else "" for e, a in zip(df["End"], df["All day"])],
+        "Event": df["Event"],
+        "Location": df["Location"],
+    }
+)
+if len(uploads) > 1:
+    out["File"] = df["File"]
+
+label = f" matching '{', '.join(keywords)}'" if keywords else ""
+st.subheader(f"{len(out)} event(s) found{label}")
+st.dataframe(out, use_container_width=True, hide_index=True)
+
+csv_bytes = out.to_csv(index=False).encode("utf-8-sig")  # BOM so Excel reads UTF-8 correctly
+st.download_button(
+    "Download table as CSV",
+    data=csv_bytes,
+    file_name="calendar_events.csv",
+    mime="text/csv",
+)
+  </script>
+
   <script type="module">
     import { mount } from "https://cdn.jsdelivr.net/npm/@stlite/browser@0.85.1/build/stlite.js";
     mount(
       {
         entrypoint: "streamlit_app.py",
+        requirements: ["icalendar"],
         files: { "streamlit_app.py": document.getElementById("app-code").textContent },
-        streamlitConfig: { "client.toolbarMode": "viewer",
-                         "theme.primaryColor": "#1F4E79"},
+        streamlitConfig: {
+          "client.toolbarMode": "viewer",
+          "theme.primaryColor": "#1F4E79",
+        },
       },
       document.getElementById("root"),
     );
