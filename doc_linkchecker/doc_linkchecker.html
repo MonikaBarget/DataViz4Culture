@@ -1,0 +1,567 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+  <title>Handbook Link Checker</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/browser@0.85.1/build/stlite.css" />
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- Python app to run in the browser -->
+  <script type="text/x-python" id="app-code">
+"""
+Link Checker - browser version (stlite / Pyodide)
+"""
+
+import asyncio
+import hashlib
+import io
+import re
+import zipfile
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from urllib.parse import quote, urlparse
+
+import pandas as pd
+import streamlit as st
+
+st.set_page_config(page_title="Handbook Link Checker", layout="wide")
+
+URL_RE = re.compile(r"https?://[^\s<>\"'\)\]]+")
+
+# Extraction of hyperlinks from input files and pattern matching
+
+W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+REL = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+TEXT = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}"
+DRAW = "{urn:oasis:names:tc:opendocument:xmlns:drawing:1.0}"
+XLINK = "{http://www.w3.org/1999/xlink}"
+HEADING_RE = re.compile(r"(?i)^(heading|title|kop|titre|berschrift)")
+
+
+def clean_url(u):
+    return re.sub(r"\s+", "", str(u)).strip()
+
+
+def typed_urls(text):
+    return [m.rstrip(".,;:!?") for m in URL_RE.findall(text)]
+
+
+def docx_rels(z, part):
+    folder, name = part.rsplit("/", 1)
+    path = f"{folder}/_rels/{name}.rels"
+    if path not in z.namelist():
+        return {}
+    root = ET.fromstring(z.read(path))
+    out = {}
+    for rel in root.iter(REL + "Relationship"):
+        if rel.get("Type", "").endswith("/hyperlink") and rel.get("TargetMode") == "External":
+            out[rel.get("Id")] = rel.get("Target", "")
+    return out
+
+
+def extract_docx(data, include_plain):
+    z = zipfile.ZipFile(io.BytesIO(data))
+    rows = []
+    part_names = sorted(
+        n for n in z.namelist()
+        if re.match(r"^word/(document|footnotes|endnotes|header\d*|footer\d*)\.xml$", n)
+    )
+    for part in part_names:
+        base = part.split("/")[-1]
+        label = ("Main text" if base.startswith("document") else
+                 "Footnotes" if base.startswith("footnotes") else
+                 "Endnotes" if base.startswith("endnotes") else
+                 "Header" if base.startswith("header") else "Footer")
+        rels = docx_rels(z, part)
+        root = ET.fromstring(z.read(part))
+        heading = ""
+
+        def add(where, text, url, kind="Hyperlink"):
+            rows.append({"Where": where, "Text": text, "URL": clean_url(url), "Type": kind})
+
+        for p in root.iter(W + "p"):
+            ptext = "".join(t.text or "" for t in p.iter(W + "t"))
+            ps = p.find(f"{W}pPr/{W}pStyle")
+            if ps is not None and HEADING_RE.match(ps.get(W + "val", "")):
+                heading = ptext.strip()[:60]
+            where = label + (f" › {heading}" if heading and label == "Main text" else "")
+            found = set()
+
+            for h in p.iter(W + "hyperlink"):
+                url = rels.get(h.get(R + "id"))
+                if url:
+                    txt = "".join(t.text or "" for t in h.iter(W + "t")).strip()
+                    add(where, txt or "(no text)", url)
+                    found.add(clean_url(url))
+            for el in p.iter(A + "hlinkClick"):
+                url = rels.get(el.get(R + "id"))
+                if url:
+                    add(where, "(image or shape)", url)
+                    found.add(clean_url(url))
+            for f in p.iter(W + "fldSimple"):
+                m = re.search(r'HYPERLINK\s+"([^"]+)"', f.get(W + "instr", ""))
+                if m:
+                    txt = "".join(t.text or "" for t in f.iter(W + "t")).strip()
+                    add(where, txt or m.group(1), m.group(1))
+                    found.add(clean_url(m.group(1)))
+            # complex fields: begin / instrText / separate / text / end
+            stage, instr, txt = None, "", ""
+            for el in p.iter():
+                if el.tag == W + "fldChar":
+                    t = el.get(W + "fldCharType")
+                    if t == "begin":
+                        stage, instr, txt = "instr", "", ""
+                    elif t == "separate" and stage == "instr":
+                        stage = "text"
+                    elif t == "end":
+                        m = re.search(r'HYPERLINK\s+"([^"]+)"', instr)
+                        if m and stage:
+                            add(where, txt.strip() or m.group(1), m.group(1))
+                            found.add(clean_url(m.group(1)))
+                        stage = None
+                elif el.tag == W + "instrText" and stage == "instr":
+                    instr += el.text or ""
+                elif el.tag == W + "t" and stage == "text":
+                    txt += el.text or ""
+
+            if include_plain:
+                for u in typed_urls(ptext):
+                    if clean_url(u) not in found:
+                        add(where, "(typed in text)", u, "Typed URL")
+
+    # remove exact duplicates (e.g. text boxes stored twice in the XML)
+    seen, out = set(), []
+    for r in rows:
+        key = (r["Where"], r["Text"], r["URL"], r["Type"])
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
+
+
+def extract_odt(data, include_plain):
+    z = zipfile.ZipFile(io.BytesIO(data))
+    rows = []
+    for part, label in (("content.xml", "Main text"), ("styles.xml", "Header/Footer")):
+        if part not in z.namelist():
+            continue
+        root = ET.fromstring(z.read(part))
+        heading = ""
+        for el in root.iter():
+            if el.tag in (TEXT + "p", TEXT + "h"):
+                ptext = "".join(el.itertext())
+                if el.tag == TEXT + "h":
+                    heading = ptext.strip()[:60]
+                if include_plain:
+                    embedded = {clean_url(a.get(XLINK + "href", "")) for a in el.iter(TEXT + "a")}
+                    where = label + (f" › {heading}" if heading and label == "Main text" else "")
+                    for u in typed_urls(ptext):
+                        if clean_url(u) not in embedded:
+                            rows.append({"Where": where, "Text": "(typed in text)", "URL": clean_url(u), "Type": "Typed URL"})
+            if el.tag in (TEXT + "a", DRAW + "a"):
+                href = el.get(XLINK + "href", "")
+                if not href or href.startswith("#"):
+                    continue  # internal link (e.g. table of contents)
+                txt = "".join(el.itertext()).strip() if el.tag == TEXT + "a" else "(image or shape)"
+                where = label + (f" › {heading}" if heading and label == "Main text" else "")
+                rows.append({"Where": where, "Text": txt or "(no text)", "URL": clean_url(href), "Type": "Hyperlink"})
+    seen, out = set(), []
+    for r in rows:
+        key = (r["Where"], r["Text"], r["URL"], r["Type"])
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
+
+
+def extract_pdf(data, include_plain):
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(data))
+    if reader.is_encrypted:
+        try:
+            reader.decrypt("")
+        except Exception:
+            raise ValueError("This PDF is password-protected.")
+    rows = []
+    for pageno, page in enumerate(reader.pages, start=1):
+        annots = page.get("/Annots")
+        links = []  # (rect, url)
+        if annots is not None:
+            for ref in annots.get_object():
+                annot = ref.get_object()
+                if annot.get("/Subtype") != "/Link":
+                    continue
+                action = annot.get("/A")
+                action = action.get_object() if action is not None else None
+                if action is None or action.get("/S") != "/URI":
+                    continue
+                uri = action.get("/URI")
+                if isinstance(uri, bytes):
+                    uri = uri.decode("latin-1")
+                try:
+                    r = [float(v) for v in annot.get("/Rect")]
+                    rect = (min(r[0], r[2]), min(r[1], r[3]), max(r[0], r[2]), max(r[1], r[3]))
+                except Exception:
+                    rect = None
+                links.append((rect, clean_url(uri)))
+
+        if links:
+            frags = []
+
+            def visitor(text, cm, tm, font_dict, font_size):
+                if text and text.strip():
+                    x = tm[4] * cm[0] + tm[5] * cm[2] + cm[4]
+                    y = tm[4] * cm[1] + tm[5] * cm[3] + cm[5]
+                    frags.append((x, y, text.strip()))
+
+            try:
+                page.extract_text(visitor_text=visitor)
+            except Exception:
+                frags = []
+            for rect, url in links:
+                txt = ""
+                if rect and frags:
+                    x1, y1, x2, y2 = rect
+                    txt = " ".join(t for x, y, t in frags if x1 - 3 <= x <= x2 + 3 and y1 - 4 <= y <= y2 + 3)
+                rows.append({"Where": f"Page {pageno}", "Text": txt[:90] or "(text not detected)", "URL": url, "Type": "Hyperlink"})
+
+        if include_plain:
+            try:
+                embedded = {u for _, u in links}
+                for u in typed_urls(page.extract_text() or ""):
+                    if clean_url(u) not in embedded:
+                        rows.append({"Where": f"Page {pageno}", "Text": "(typed in text)", "URL": clean_url(u), "Type": "Typed URL"})
+            except Exception:
+                pass
+    return rows
+
+
+@st.cache_data(show_spinner="Reading the document and collecting links…")
+def extract_links(data, ext, include_plain):
+    if ext == "docx":
+        return extract_docx(data, include_plain)
+    if ext == "odt":
+        return extract_odt(data, include_plain)
+    if ext == "pdf":
+        return extract_pdf(data, include_plain)
+    raise ValueError("Unsupported file type")
+
+
+# Check validity of target URLs based on site content
+
+def url_key(u):
+    return u.split("#")[0]
+
+
+async def fetch_status(url, timeout, **kwargs):
+    from pyodide.http import pyfetch
+    return await asyncio.wait_for(pyfetch(url, referrerPolicy="no-referrer", cache="no-store", **kwargs), timeout)
+
+
+NOT_FOUND_PHRASES = (
+    "page not found", "not found", "404", "niet gevonden", "bestaat niet", "does not exist", "doesn't exist",
+    "no longer available", "no longer exists", "seite nicht gefunden", "page introuvable", "no encontrada",
+)
+PARKED_PHRASES = (
+    "domain is for sale", "domain may be for sale", "this domain is for sale", "buy this domain",
+    "domain parking", "parked domain", "parked free", "domain has expired", "expired domain",
+    "account suspended", "website is suspended", "te koop",
+)
+PARKED_HOSTS = ("sedo.com", "hugedomains.com", "dan.com", "afternic.com", "parkingcrew.net", "bodis.com")
+
+
+def bare_host(u):
+    h = (urlparse(u).hostname or "").lower()
+    return h[4:] if h.startswith("www.") else h
+
+
+def analyse(d, original):
+    """Turn the checker service's JSON answer into (status, detail, page title, final URL)."""
+    if d.get("error"):
+        err = str(d["error"])
+        if err.startswith("timeout"):
+            return "Timeout", err, "", ""
+        return "Unreachable", err, "", ""
+    code = int(d.get("status", 0))
+    title = (d.get("title") or "").strip()
+    text = (d.get("text") or "").strip()
+    final = d.get("finalUrl") or original
+    if code in (404, 410):
+        return "Broken", f"HTTP {code} (page not found)", title, final
+    if code in (401, 403, 451):
+        return "Restricted", f"HTTP {code} (login required or blocks automated visits)", title, final
+    if code == 429:
+        return "Rate limited", "HTTP 429 (too many requests; try again later)", title, final
+    if 500 <= code < 600:
+        return "Server error", f"HTTP {code}", title, final
+    if not (200 <= code < 300):
+        return "Broken", f"HTTP {code}", title, final
+
+    head = f"{title} {text[:200]}".lower()
+    if any(h in bare_host(final) for h in PARKED_HOSTS) or any(p in head for p in PARKED_PHRASES):
+        return "Parked or expired", "page looks like a parked, expired or for-sale domain", title, final
+    if any(p in title.lower() for p in NOT_FOUND_PHRASES) or any(p in text[:150].lower() for p in NOT_FOUND_PHRASES):
+        return "Looks broken", f"HTTP {code} but the page says 'not found' (soft 404)", title, final
+    if bare_host(final) != bare_host(original):
+        return "Redirected", f"now at {final} (different site: check it is still the intended one)", title, final
+    o_path = urlparse(original).path.strip("/")
+    f_path = urlparse(final).path.strip("/")
+    if o_path and not f_path:
+        return "Redirected", "sent to the site's homepage (page probably removed)", title, final
+    return "OK", f"HTTP {code}", title, final
+
+
+async def check_with_service(url, timeout, service):
+    base, token = service
+    endpoint = base.rstrip("/") + "/check?url=" + quote(url, safe="")
+    kwargs = {"headers": {"X-Token": token}} if token else {}
+    try:
+        resp = await fetch_status(endpoint, timeout + 5, **kwargs)
+    except asyncio.TimeoutError:
+        return "Timeout", "checker service did not answer in time", "", ""
+    except Exception as exc:
+        return "Not checked", f"could not reach your checker service ({str(exc)[:60]})", "", ""
+    if resp.status != 200:
+        return "Not checked", f"checker service answered HTTP {resp.status} (wrong token or origin?)", "", ""
+    try:
+        data = await resp.json()
+    except Exception:
+        return "Not checked", "checker service sent an unreadable answer", "", ""
+    return analyse(data, url)
+
+
+async def check_url(url, timeout, service):
+    try:
+        if service:
+            return await check_with_service(url, timeout, service)
+
+        # Browser-only mode: 'no-cors' succeeds whenever a server answers, but the HTTP status is hidden.
+        candidates = [url]
+        if url.startswith("http://"):
+            candidates = ["https://" + url[7:], url]  # browsers block plain-http requests from https pages
+        last_err = ""
+        for i, target in enumerate(candidates):
+            try:
+                await fetch_status(target, timeout, mode="no-cors")
+                note = "server answered (status code not visible in browser-only mode)"
+                if i == 0 and len(candidates) == 2:
+                    note = "answered over https (link uses http); " + note
+                return "Reachable", note
+            except asyncio.TimeoutError:
+                last_err = "timeout"
+            except Exception as exc:
+                last_err = str(exc)[:80]
+        if last_err == "timeout":
+            return "Timeout", f"no answer within {timeout} s"
+        extra = " (plain-http sites may be blocked by the browser; check manually)" if url.startswith("http://") else ""
+        return "Unreachable", "no server answered: dead domain, server down, or blocked" + extra
+    except asyncio.TimeoutError:
+        return "Timeout", f"no answer within {timeout} s"
+    except Exception as exc:
+        return "Unreachable", f"request failed ({str(exc)[:80]})"
+
+
+async def run_checks(keys, timeout, parallel, service):
+    sem = asyncio.Semaphore(parallel)
+
+    async def one(k):
+        async with sem:
+            r = tuple(await check_url(k, timeout, service))
+            return k, r + ("",) * (4 - len(r))
+
+    results = {}
+    bar = st.progress(0.0, text="Checking links…")
+    tasks = [asyncio.ensure_future(one(k)) for k in keys]
+    done = 0
+    for fut in asyncio.as_completed(tasks):
+        k, res = await fut
+        results[k] = res
+        done += 1
+        bar.progress(done / len(keys), text=f"Checked {done} of {len(keys)} web addresses")
+    bar.empty()
+    return results
+
+
+# Generate UI
+
+ORDER = ["Broken", "Looks broken", "Unreachable", "Timeout", "Server error", "Parked or expired",
+         "Redirected", "Restricted", "Rate limited", "Not checked", "Reachable", "OK", "Skipped"]
+ICON = {
+    "Broken": "❌", "Looks broken": "❌", "Unreachable": "❌", "Timeout": "⏱️", "Server error": "⚠️",
+    "Parked or expired": "🅿️", "Redirected": "↪️", "Restricted": "🔒", "Rate limited": "🕒",
+    "Not checked": "❔", "Reachable": "✅", "OK": "✅", "Skipped": "➖",
+}
+PROBLEM = {"Broken", "Looks broken", "Unreachable", "Timeout", "Server error", "Parked or expired"}
+REVIEW = {"Redirected", "Restricted", "Rate limited", "Not checked"}
+GOOD = {"OK", "Reachable"}
+
+st.title("Link Checker")
+st.markdown(
+    "Upload a text document, such as a teaching handbook, in `.docx`, `.odt` or `.pdf` format to check whether its hyperlinks still work. "
+    "The document is read in your browser and is not uploaded to any server. "
+    "This app is still under construction and I cannot guarantee correct results."
+)
+
+with st.sidebar:
+    st.header("Settings")
+    include_plain = st.checkbox(
+        "Also check web addresses typed out as plain text", value=False,
+        help="By default only embedded hyperlinks are checked.",
+    )
+    timeout = st.slider("Timeout per link (seconds)", 3, 30, 10)
+    parallel = st.slider("Checks at the same time", 1, 20, 8)
+    with st.expander("Checker service (recommended)", expanded=True):
+        st.markdown(
+            "Browsers hide the content of other websites from this page, so on its own the app can only tell "
+            "whether a server answers at all. Connect your own checker service "
+            " and the app can read each page's status code and title, spotting 404s, "
+            "'soft 404' pages, parked or expired domains and redirects to a homepage."
+        )
+        service_url = st.text_input("Checker service address", placeholder="https://link-checker.yourname.workers.dev").strip()
+        service_token = st.text_input("Access token (if you set one)", type="password")
+        st.caption("The service sees the web addresses you check, but never your document.")
+        if service_url and not service_url.startswith("https://"):
+            st.error("The address must start with https://")
+            service_url = ""
+service = (service_url, service_token) if service_url else None
+
+with st.expander("How checking works and what it can't tell you"):
+    st.markdown(
+        "- **With a checker service:** your service fetches each page and reports the status code, final address, "
+        "title and the first lines of text. The app then flags: `Broken` (404/410), `Looks broken` (a normal-looking "
+        "response whose page says 'not found'), `Parked or expired` (domain for sale or expired), `Redirected` "
+        "(sent to another site or to the homepage: review), `Restricted` (401/403, often a login or bot protection), "
+        "`Rate limited` and `Server error`.\n"
+        "- **Without one (browser-only):** `Reachable` means a server answered; `Unreachable` or `Timeout` means "
+        "nothing answered. A removed page on a site that is still online will still show as reachable, because "
+        "the browser doesn't reveal the status code.\n"
+        "- These checks spot broken, parked and moved pages. They are **not a safety scan**, so they cannot tell whether "
+        "a live site is trustworthy or malicious. Use the page title column and a manual look for that.\n"
+        "- Some sites block automated visits, so `Restricted` results deserve a manual look.\n"
+        "- `mailto:`, `tel:`, relative paths and internal links (e.g. table of contents) are not web checks. "
+        "Mail and relative links are listed as Skipped; internal links are left out.\n"
+        "- A link that works today can still point to the wrong or changed content."
+    )
+
+upload = st.file_uploader("Upload a handbook", type=["docx", "odt", "pdf"])
+if not upload:
+    st.info("Upload a file to get started.")
+    st.stop()
+
+data = upload.getvalue()
+ext = upload.name.rsplit(".", 1)[-1].lower()
+
+try:
+    found = extract_links(data, ext, include_plain)
+except Exception as exc:
+    st.error(f"Could not read **{upload.name}**: {exc}")
+    st.stop()
+
+if not found:
+    st.info(
+        "No hyperlinks found. For PDFs this can also mean the file is a scan or its links were flattened; "
+        "try the option to also check typed-out web addresses."
+    )
+    st.stop()
+
+df = pd.DataFrame(found)
+df["Scheme"] = [urlparse(u).scheme.lower() for u in df["URL"]]
+df["Web"] = df["Scheme"].isin(["http", "https"])
+keys = sorted({url_key(u) for u in df.loc[df["Web"], "URL"]})
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Links in document", len(df))
+c2.metric("Unique web addresses", len(keys))
+c3.metric("Not web links (skipped)", int((~df["Web"]).sum()))
+
+sig = hashlib.md5(data).hexdigest() + f"|{include_plain}"
+if keys and st.button("Check links", type="primary"):
+    results = await run_checks(keys, timeout, parallel, service)
+    st.session_state["link_results"] = {
+        "sig": sig, "data": results, "mode": "service" if service else "browser",
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+
+stored = st.session_state.get("link_results")
+if not stored or stored["sig"] != sig:
+    st.info("Press **Check links** to test the web addresses." if keys else "No web addresses to check.")
+    st.stop()
+
+res = stored["data"]
+statuses, details, titles, finals = [], [], [], []
+for u, web in zip(df["URL"], df["Web"]):
+    if web:
+        s, d, t, f = res.get(url_key(u), ("Not checked", "no result", "", ""))
+    else:
+        s, d, t, f = "Skipped", "not a web link (e.g. mailto, relative path)", "", ""
+    statuses.append(s)
+    details.append(d)
+    titles.append(t)
+    finals.append(f if f and f != u else "")
+df["Status"] = statuses
+df["Detail"] = details
+df["Page title"] = titles
+df["Final URL"] = finals
+df["_o"] = df["Status"].map({s: i for i, s in enumerate(ORDER)}).fillna(99)
+df = df.sort_values(["_o", "Where"]).reset_index(drop=True)
+df["Result"] = [f"{ICON.get(s, '')} {s}" for s in df["Status"]]
+
+st.subheader("Results")
+st.caption(
+    f"Checked {stored['time']} in "
+    + ("checker-service mode (status codes and page content)." if stored["mode"] == "service"
+       else "browser-only mode: this detects dead sites, but NOT removed pages on live sites (404s). "
+            "Connect a checker service in the sidebar for full checks.")
+)
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Working", int(df["Status"].isin(GOOD).sum()))
+m2.metric("Problems", int(df["Status"].isin(PROBLEM).sum()))
+m3.metric("Worth a manual look", int(df["Status"].isin(REVIEW).sum()))
+m4.metric("Skipped", int((df["Status"] == "Skipped").sum()))
+
+view = st.radio("Show", ["Problems and things to check", "Everything"], horizontal=True)
+shown = df if view == "Everything" else df[df["Status"].isin(PROBLEM | REVIEW)]
+
+if shown.empty:
+    st.success("Nothing to flag." if view != "Everything" else "No rows.")
+else:
+    st.dataframe(
+        shown[["Result", "URL", "Text", "Where", "Type", "Detail", "Page title", "Final URL"]],
+        use_container_width=True,
+        hide_index=True,
+        column_config={"URL": st.column_config.LinkColumn("URL")},
+    )
+
+export = df[["Status", "URL", "Text", "Where", "Type", "Detail", "Page title", "Final URL"]]
+st.download_button(
+    "Download full results as CSV",
+    data=export.to_csv(index=False).encode("utf-8-sig"),
+    file_name="link_check_results.csv",
+    mime="text/csv",
+)
+  </script>
+
+  <script type="module">
+    import { mount } from "https://cdn.jsdelivr.net/npm/@stlite/browser@0.85.1/build/stlite.js";
+    mount(
+      {
+        entrypoint: "streamlit_app.py",
+        requirements: ["pypdf"],
+        files: { "streamlit_app.py": document.getElementById("app-code").textContent },
+        streamlitConfig: {
+          "client.toolbarMode": "viewer",
+          "theme.primaryColor": "#1F4E79",
+        },
+      },
+      document.getElementById("root"),
+    );
+  </script>
+</body>
+</html>
