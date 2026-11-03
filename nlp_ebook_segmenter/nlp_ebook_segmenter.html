@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+  <title>E-Book Text Segmenter</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/browser@0.85.1/build/stlite.css" />
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- Python app to run in the browser -->
+  <script type="text/x-python" id="app-code">
+"""
+NLP E-Book Segmenter - browser version (stlite / Pyodide)
+Splits any HTML page at its <h1>-<h6> headings and bundles chosen sections into .txt files.
+"""
+
+import asyncio
+import hashlib
+import io
+import re
+import zipfile
+from html import unescape
+
+import streamlit as st
+
+st.set_page_config(page_title="E-Book Text Segmenter", layout="wide")
+
+
+def html_to_text(chunk):
+    """Turns a piece of HTML into plain text with paragraph breaks."""
+    chunk = chunk.replace("\r", " ").replace("\n", " ")
+    chunk = re.sub(r"(?i)<br\s*/?>", "\n", chunk)
+    chunk = re.sub(r"(?i)</(p|div|li|tr|blockquote|pre|table|ul|ol)>", "\n\n", chunk)
+    text = unescape(re.sub(r"<[^>]+>", "", chunk))
+    text = "\n".join(" ".join(line.split()) for line in text.split("\n"))
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def split_by_headings(page):
+    """Returns {1: {...}, 2: {...}, ...}: for every heading level, a dictionary {heading: text}.
+    The text of a section runs from its heading to the next heading of the same or a higher level,
+    so sub-headings stay inside their chapter."""
+    page = re.sub(r"(?is)<!--.*?-->|<(script|style|noscript|head)\b.*?</\1>", " ", page)
+    parts = re.split(r"(?is)<h([1-6])\b[^>]*>(.*?)</h\1\s*>", page)
+
+    # parts = [text, level, heading, text, level, heading, text, ...]
+    items = [("text", 0, html_to_text(parts[0]))]
+    for i in range(1, len(parts), 3):
+        items.append(("heading", int(parts[i]), " ".join(html_to_text(parts[i + 1]).split())))
+        items.append(("text", 0, html_to_text(parts[i + 2])))
+
+    dics = {}
+    for n in range(1, 7):
+        sections, current = {}, None
+        for kind, level, content in items:
+            if kind == "heading" and level <= n:
+                current = None
+                if level == n:
+                    key, k = content, 1
+                    while key in sections:  # same heading twice, e.g. "Chapter 1" in two volumes
+                        k += 1
+                        key = f"{content} [{k}]"
+                    current = sections[key] = [content]
+            elif current is not None and content:
+                current.append(content)
+        for key in list(sections):
+            if f"{key} [2]" in sections:
+                sections[f"{key} [1]"] = sections.pop(key)
+        if sections:
+            dics[n] = {key: "\n\n".join(lines) for key, lines in sections.items()}
+    return dics
+
+
+def find_section(name, dics):
+    """Looks for a heading with exactly this name in the heading dictionaries. Returns (text, error)."""
+    hits = [(n, d[name]) for n, d in dics.items() if name in d]
+    if len(hits) == 1:
+        return hits[0][1], None
+    if len(hits) > 1:
+        levels = ", ".join(f"H{n}" for n, _ in hits)
+        return None, f"“{name}” is ambiguous. It is used a heading on several levels ({levels})."
+    repeats = [key for d in dics.values() for key in d if key.startswith(f"{name} [")]
+    if repeats:
+        return None, (
+            f"“{name}” is ambiguous. This heading appears {len(repeats)} times in the book. "
+            f"Choose one by typing: {', '.join(repeats[:6])}."
+        )
+    return None, (
+        f"“{name}” was not found. Section names must be typed exactly as they are written in the book, "
+        "including punctuation and capital letters. See the list of headings above."
+    )
+
+
+# Create UI
+
+st.title("NLP E-Book Segmenter")
+st.markdown("This app helps you segment e-books available online in HTML format for computational text analysis / NLP.")
+st.markdown(
+    "It lets you create several plain text (.txt) files consisting of selected chapters / book sections, "
+    "for example to analyse character points of view in comparison."
+)
+st.markdown(
+    "To use the app, you need to provide the URL of an e-book (e.g. from Project Gutenberg) or another "
+    "online text with headings (written as <h1>, <h2> etc. in HTML), and can then define your sub-sections."
+)
+st.info("Please respect copyright regulations when using this app and only work with documents in the public domain.")
+st.caption(
+    "Note: This app is still under construction and has only been tested with a small sample of "
+    "Project Gutenberg e-books so far. If you find any issues or have suggestions for improvement, "
+    "please contact Monika Barget."
+)
+
+# Load the page
+st.subheader("1. Load the text")
+url = st.text_input(
+    "Web address (URL) of the text in HTML format",
+    placeholder="https://www.gutenberg.org/cache/epub/84/pg84-images.html",
+)
+load = st.button("Load text", type="primary")
+with st.expander("Can't load the address? Upload the saved HTML file instead"):
+    st.caption("Open the page in your browser, choose File > Save Page As (HTML), then upload that file here.")
+    upload = st.file_uploader("HTML file", type=["html", "htm", "xhtml"])
+
+page = source = None
+if load:
+    try:
+        if not url.strip().startswith(("http://", "https://")):
+            raise ValueError("Please enter a web address starting with https://")
+        from pyodide.http import pyfetch
+
+        with st.spinner("Downloading the text…"):
+            resp = await asyncio.wait_for(pyfetch(url.strip(), cache="no-store"), 30)
+            if resp.status != 200:
+                raise ValueError(f"The server answered HTTP {resp.status}.")
+            page, source = await resp.string(), url.strip()
+    except ValueError as exc:
+        st.error(str(exc))
+    except Exception:
+        st.error(
+            "The browser could not load that address. Many websites do not allow other web pages to download "
+            "their files. Please upload the saved HTML file instead (see above)."
+        )
+if upload is not None:
+    sig = hashlib.md5(upload.getvalue()).hexdigest()
+    if st.session_state.get("upload_sig") != sig:
+        st.session_state["upload_sig"] = sig
+        page, source = upload.getvalue().decode("utf-8", errors="replace"), upload.name
+if page:
+    st.session_state["dics"] = split_by_headings(page)
+    st.session_state["source"] = source
+
+dics = st.session_state.get("dics")
+if dics is None:
+    st.info("Load a text to continue.")
+    st.stop()
+if not dics:
+    st.error("No headings (H1–H6) were found on this page, so it cannot be segmented.")
+    st.stop()
+
+st.success("Headings found: " + ", ".join(f"{len(d)} × H{n}" for n, d in dics.items()))
+with st.expander("Show all headings (copy section names from here)"):
+    st.caption(
+        "Chapters are usually H2 or H3. A section contains everything up to the next heading of the same "
+        "or a higher level, so sub-headings stay inside their chapter."
+    )
+    st.dataframe(
+        [{"Level": f"H{n}", "Heading": key, "Words": len(text.split())} for n, d in dics.items() for key, text in d.items()],
+        use_container_width=True,
+        hide_index=True,
+    )
+
+# Define segments
+st.subheader("2. Define your segments")
+st.caption(
+    "Type each section name exactly as it is written in the text, including punctuation and capital letters. "
+    "Separate sections with commas (or with semicolons / new lines if a heading itself contains a comma)."
+)
+if "segs" not in st.session_state:
+    st.session_state["segs"], st.session_state["next_id"] = [1, 2], 3
+
+
+def add_segment():
+    st.session_state["segs"].append(st.session_state["next_id"])
+    st.session_state["next_id"] += 1
+
+
+def remove_segment(sid):
+    st.session_state["segs"].remove(sid)
+
+
+for pos, sid in enumerate(st.session_state["segs"]):
+    with st.container(border=True):
+        c1, c2, c3 = st.columns([2, 5, 1])
+        c1.text_input(f"Segment {pos + 1}: name", key=f"name_{sid}", placeholder="e.g. letters")
+        c2.text_area("Sections", key=f"terms_{sid}", placeholder="e.g. Letter 1, Letter 2, Letter 3", height=90)
+        if len(st.session_state["segs"]) > 1:
+            c3.write("")
+            c3.write("")
+            c3.button("Remove", key=f"rm_{sid}", on_click=remove_segment, args=(sid,))
+st.button("＋ Add another segment", on_click=add_segment)
+
+# Check and download
+st.subheader("3. Check and download")
+files = {}
+filled = 0
+for pos, sid in enumerate(st.session_state["segs"]):
+    name = st.session_state.get(f"name_{sid}", "").strip()
+    raw = st.session_state.get(f"terms_{sid}", "")
+    if not name and not raw.strip():
+        continue
+    filled += 1
+    separator = r"[;\n]" if (";" in raw or "\n" in raw) else ","
+    terms = [" ".join(t.split()) for t in re.split(separator, raw) if t.strip()]
+    texts, errors = [], []
+    for term in terms:
+        text, error = find_section(term, dics)
+        (errors if error else texts).append(error or text)
+    filename = re.sub(r"[^\w\-]+", "_", name).strip("_") or f"segment_{pos + 1}"
+    if filename in files:
+        errors.append(f"Another segment already uses the name “{filename}”. Please choose different names.")
+    if not terms:
+        errors.append("No sections were given.")
+
+    if errors:
+        st.error(f"**{name or 'Segment ' + str(pos + 1)}** could not be created:\n\n" + "\n".join(f"- {e}" for e in errors))
+    else:
+        files[filename] = "\n\n\n".join(texts) + "\n"
+        st.success(f"**{filename}.txt**: {len(texts)} section(s), {len(files[filename].split())} words")
+
+if not filled:
+    st.info("Fill in at least one segment above.")
+elif files:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as z:
+        for filename, text in files.items():
+            z.writestr(f"{filename}.txt", text)
+    st.download_button(
+        f"Download zip ({len(files)} file{'s' if len(files) > 1 else ''})",
+        data=buffer.getvalue(),
+        file_name="segments.zip",
+        mime="application/zip",
+        type="primary",
+    )
+  </script>
+
+  <script type="module">
+    import { mount } from "https://cdn.jsdelivr.net/npm/@stlite/browser@0.85.1/build/stlite.js";
+    mount(
+      {
+        entrypoint: "streamlit_app.py",
+        files: { "streamlit_app.py": document.getElementById("app-code").textContent },
+        streamlitConfig: {
+          "client.toolbarMode": "viewer",
+          "theme.primaryColor": "#1F4E79",
+        },
+      },
+      document.getElementById("root"),
+    );
+  </script>
+</body>
+</html>
