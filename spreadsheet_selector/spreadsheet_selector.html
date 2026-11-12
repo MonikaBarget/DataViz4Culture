@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+  <title>Column Selector and Merger</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/browser@0.85.1/build/stlite.css" />
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- Python app to run in the browser -->
+  <script type="text/x-python" id="app-code">
+"""
+Spreadsheet selector - browser version (stlite / Pyodide)
+Upload a CSV or Excel file, reduce its columns, merge columns, download the result as CSV.
+Everything runs in your browser and your data is not uploaded anywhere.
+"""
+
+import hashlib
+import io
+
+import pandas as pd
+import streamlit as st
+
+st.set_page_config(page_title="Column Selector and Merger", layout="wide")
+
+
+@st.cache_data
+def read_file(data, name):
+    """Returns {sheet name: DataFrame}. CSV files have a single 'data' sheet."""
+    if name.lower().endswith(".csv"):
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            text = data.decode("cp1252")
+        return {"data": pd.read_csv(io.StringIO(text), sep=None, engine="python")}  # sep=None detects , ; or tab
+    return pd.read_excel(io.BytesIO(data), sheet_name=None)
+
+
+def remove_merge(i):
+    st.session_state["merges"].pop(i)
+
+
+st.title("Spreadsheet Selector")
+st.markdown(
+    "Upload a CSV or Excel file, reduce its rows by keywords found in the cells, choose the columns you need, "
+    "merge columns into new ones and download the result as a CSV file. Your data is processed in your browser and is not "
+    "uploaded anywhere. This app is still under construction."
+)
+
+# Upload
+st.subheader("1. Upload your file")
+upload = st.file_uploader("Upload your CSV or XLSX file", type=["csv", "xlsx"])
+if not upload:
+    st.info("Upload a file to get started.")
+    st.stop()
+
+data = upload.getvalue()
+sig = hashlib.md5(data).hexdigest()
+if st.session_state.get("sig") != sig:  # new file: forget merges from the previous one
+    st.session_state["sig"] = sig
+    st.session_state["merges"] = []
+
+try:
+    sheets = read_file(data, upload.name)
+except Exception as exc:
+    st.error(f"Could not read **{upload.name}**: {exc}")
+    st.stop()
+
+sheet = st.selectbox("Sheet", list(sheets)) if len(sheets) > 1 else list(sheets)[0]
+df = sheets[sheet]
+df.columns = [str(c) for c in df.columns]
+if df.columns.duplicated().any():
+    st.warning("Some column names appear more than once. Only the first column of each name is used.")
+    df = df.loc[:, ~df.columns.duplicated()]
+st.success(f"Loaded '{upload.name}' with {len(df.columns)} columns and {len(df)} rows.")
+
+# Reduce the rows by keywords
+st.subheader("2. Reduce the rows by keywords (optional)")
+cols = list(df.columns)
+c1, c2 = st.columns([3, 1])
+kw_text = c1.text_input(
+    "Keywords (comma-separated)",
+    placeholder="e.g. Amsterdam, Utrecht",
+    help="The keywords are searched in the cell contents, ignoring capital letters. Leave empty to keep all rows.",
+)
+mode = c2.radio("Rows containing a keyword are", ["kept", "removed"])
+search_cols = st.multiselect("Search in these columns", cols, default=cols, key=f"search_{sig}_{sheet}")
+keywords = [k.strip().lower() for k in kw_text.split(",") if k.strip()]
+if keywords:
+    if not search_cols:
+        st.warning("Please choose at least one column to search in.")
+        st.stop()
+    haystack = df[search_cols].fillna("").astype(str).agg(" | ".join, axis=1).str.lower()
+    hit = haystack.apply(lambda text: any(k in text for k in keywords))
+    df = df[hit] if mode == "kept" else df[~hit]
+    st.caption(f"{int(hit.sum())} of {len(hit)} rows contain a keyword. {len(df)} rows remain.")
+    if df.empty:
+        st.warning("No rows are left. Please change the keywords or the mode.")
+        st.stop()
+
+# Columns to keep
+st.subheader("3. Choose columns to keep")
+keep = st.multiselect("Columns to keep", cols, default=cols, key=f"keep_{sig}_{sheet}")
+if not keep:
+    st.warning("Please keep at least one column.")
+    st.stop()
+
+# Merge (optional)
+st.subheader("4. Merge columns (optional and you can repeat this)")
+with st.container(border=True):
+    m_cols = st.multiselect(
+        "Columns to MERGE (in this order)", keep, key=f"mcols_{hashlib.md5('|'.join(keep).encode()).hexdigest()}"
+    )
+    c1, c2 = st.columns(2)
+    m_name = c1.text_input("New name", "MergedColumn")
+    m_sep = c2.text_input("Separator", ", ")
+    if st.button("Add merge"):
+        if not m_cols:
+            st.warning("Please select at least one column to merge.")
+        elif not m_name.strip():
+            st.warning("Please give the new column a name.")
+        elif m_name in cols or any(m["name"] == m_name for m in st.session_state["merges"]):
+            st.warning(f"A column called '{m_name}' already exists. Please choose another name.")
+        else:
+            st.session_state["merges"].append({"cols": m_cols, "name": m_name, "sep": m_sep})
+
+result = df[keep].copy()
+for i, m in enumerate(st.session_state["merges"]):
+    c1, c2 = st.columns([8, 1])
+    c1.write(f"• **{m['name']}**: {', '.join(m['cols'])} (separator '{m['sep']}')")
+    c2.button("Remove", key=f"rm_{i}_{m['name']}", on_click=remove_merge, args=(i,))
+    missing = [c for c in m["cols"] if c not in keep]
+    if missing:
+        st.warning(f"'{m['name']}' is not in the result because you no longer keep: {', '.join(missing)}")
+    else:
+        result[m["name"]] = df[m["cols"]].fillna("").astype(str).agg(m["sep"].join, axis=1)
+
+# Preview and download
+st.subheader("5. Preview and download")
+st.caption(f"{len(result.columns)} columns, {len(result)} rows. First 20 rows:")
+st.dataframe(result.head(20), use_container_width=True)
+st.download_button(
+    "Finish & Download",
+    data=result.to_csv(index=False).encode("utf-8-sig"),  # BOM so Excel reads accents correctly
+    file_name="selected_columns.csv",
+    mime="text/csv",
+    type="primary",
+)
+  </script>
+
+  <script type="module">
+    import { mount } from "https://cdn.jsdelivr.net/npm/@stlite/browser@0.85.1/build/stlite.js";
+    mount(
+      {
+        entrypoint: "streamlit_app.py",
+        requirements: ["openpyxl"],
+        files: { "streamlit_app.py": document.getElementById("app-code").textContent },
+        streamlitConfig: {
+          "client.toolbarMode": "viewer",
+          "theme.primaryColor": "#1F4E79",
+        },
+      },
+      document.getElementById("root"),
+    );
+  </script>
+</body>
+</html>
