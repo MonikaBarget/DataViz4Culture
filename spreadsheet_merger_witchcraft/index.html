@@ -31,10 +31,8 @@ API_URL = f"https://api.github.com/repos/{REPO}/contents/{FOLDER}?ref={BRANCH}"
 ACCUSED_FILE, ACCUSED_KEY = "WDB_Accused.csv", "AccusedRef"  # core table on the accused, and the column linking to it
 CASE_FILE, CASE_KEY = "WDB_Case.csv", "CaseRef"  # core table on the cases, and the column linking to it
 
-
 def find_col(df, name):
     return next((c for c in df.columns if c.strip().lower() == name.lower()), None)
-
 
 async def get_table(name, sources):
     cache = st.session_state.setdefault("cache", {})
@@ -59,7 +57,6 @@ async def get_table(name, sources):
         cache[name] = df
     return df
 
-
 def add_columns(table, ref, left_key, right_key, picked, suffix):
     ref = ref[[right_key] + picked].copy()
     ref[right_key] = ref[right_key].str.strip()
@@ -73,19 +70,20 @@ def add_columns(table, ref, left_key, right_key, picked, suffix):
     new_columns = [c + suffix if c in table.columns else c for c in picked]
     return merged.drop(columns=["_key", "_found"]), new_columns, matched, duplicates
 
-
 # Generate UI
 
 st.title("Spreadsheet Merger Witchcraft")
 st.markdown(
     "The Scottish witchcraft trial data published by the University of Edinburgh is spread over 38 individual tables. This app lets you pick an information "
     "table based on a short preview, add details about the **accused** and/or the **case** from the project's two core tables, and download "
-    "everything as one CSV file. Your choices are processed in your browser and you can download them as a new CSV file for data cleaning and visualisation."
+    "everything as one CSV file. Your choices are processed in your browser and you can download them as a new CSV file for data cleaning and visualisation. "
+    "Problems such as unavailable data are explicitly flagged by the app where possible. If you encounter unknown errors, please contact Monika Barget."
 )
 st.caption(f"Data source: GitHub repository {REPO}. This data set is based on: University of Edinburgh. School of History, Classics and Archaeology. (2010). Survey of Scottish Witchcraft, 1563 - 1736. Retrieved 16 November 2026, from https://find.data.gov.scot/datasets/33033 
 License: Creative Commons Attribution 4.0 International")
 
 # Show the list of tables
+    
 if "sources" not in st.session_state:
     try:
         from pyodide.http import pyfetch
@@ -106,7 +104,7 @@ if not sources:
         "The list of tables could not be loaded from GitHub"
         + (f" ({st.session_state['load_error']})" if st.session_state["load_error"] else "")
         + ". You can try again, or upload the CSV files yourself: the two core tables "
-        f"({ACCUSED_FILE}, {CASE_FILE}) and the information tables you need."
+        f"({ACCUSED_FILE}, {CASE_FILE}) and the extra information tables you need."
     )
     if st.button("Try again"):
         del st.session_state["sources"]
@@ -117,6 +115,7 @@ if not sources:
         st.stop()
 
 # Choose the information table
+    
 st.subheader("1. Choose an information table")
 core = {ACCUSED_FILE, CASE_FILE}
 choices = sorted(n for n in sources if n not in core)
@@ -140,12 +139,13 @@ base_keep = st.multiselect(
 )
 
 # Add information about the accused and/or the case
+    
 st.subheader("2. Add information about the accused and/or the case")
 result, added, offered = table, [], False
 for label, filename, key, suffix in [
     ("accused", ACCUSED_FILE, ACCUSED_KEY, "_accused"),
     ("case", CASE_FILE, CASE_KEY, "_case"),
-]:
+    ]:
     left_key = find_col(table, key)
     via_case = False  # accused information reached indirectly: table -> CaseRef -> WDB_Case -> AccusedRef
     if not left_key and label == "accused" and find_col(table, CASE_KEY) and CASE_FILE in sources:
@@ -195,6 +195,7 @@ if not offered:
     st.info(f"This table has neither an {ACCUSED_KEY} nor a {CASE_KEY} column, so nothing can be added from the core tables.")
 
 # Name and download new file
+    
 st.subheader("3. Name your file and download it")
 final = result[base_keep + added]
 if final.empty or len(final.columns) == 0:
