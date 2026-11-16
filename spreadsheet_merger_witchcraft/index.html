@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no" />
+  <title>Spreadsheet Merger Witchcraft</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@stlite/browser@0.85.1/build/stlite.css" />
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- Python app to run in the browser -->
+  <script type="text/x-python" id="app-code">
+"""
+Spreadsheet Merger Witchcraft - browser version (stlite / Pyodide)
+Pick an information table, add columns about the accused and/or the case, download one merged CSV.
+"""
+
+import io
+import re
+
+import pandas as pd
+import streamlit as st
+
+st.set_page_config(page_title="Scottish Witchcraft Data Merger", layout="wide")
+
+# Settings to access data on GitHub
+
+REPO, BRANCH, FOLDER = "SallyM/witches", "master", "datasets/history-scottish-witchcraft"
+API_URL = f"https://api.github.com/repos/{REPO}/contents/{FOLDER}?ref={BRANCH}"
+ACCUSED_FILE, ACCUSED_KEY = "WDB_Accused.csv", "AccusedRef"  # core table on the accused, and the column linking to it
+CASE_FILE, CASE_KEY = "WDB_Case.csv", "CaseRef"  # core table on the cases, and the column linking to it
+
+
+def find_col(df, name):
+    return next((c for c in df.columns if c.strip().lower() == name.lower()), None)
+
+
+async def get_table(name, sources):
+    cache = st.session_state.setdefault("cache", {})
+    if name in cache:
+        return cache[name]
+    source = sources[name]
+    if isinstance(source, bytes):
+        raw = source
+    else:
+        from pyodide.http import pyfetch
+
+        resp = await pyfetch(source)
+        if resp.status != 200:
+            raise ValueError(f"Could not download {name} (HTTP {resp.status}).")
+        raw = await resp.bytes()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("cp1252", errors="replace")
+    df = pd.read_csv(io.StringIO(text), dtype=str, keep_default_na=False)
+    if not isinstance(source, bytes):
+        cache[name] = df
+    return df
+
+
+def add_columns(table, ref, left_key, right_key, picked, suffix):
+    ref = ref[[right_key] + picked].copy()
+    ref[right_key] = ref[right_key].str.strip()
+    ref = ref[ref[right_key] != ""]  # empty IDs must never match each other
+    duplicates = int(ref[right_key].duplicated().sum())
+    ref = ref.drop_duplicates(right_key).rename(columns={right_key: "_key"})
+    merged = table.assign(_key=table[left_key].str.strip()).merge(
+        ref, on="_key", how="left", suffixes=("", suffix), indicator="_found"
+    )
+    matched = int((merged["_found"] == "both").sum())
+    new_columns = [c + suffix if c in table.columns else c for c in picked]
+    return merged.drop(columns=["_key", "_found"]), new_columns, matched, duplicates
+
+
+# Generate UI
+
+st.title("Spreadsheet Merger Witchcraft")
+st.markdown(
+    "The Scottish witchcraft trial data published by the University of Edinburgh is spread over 38 individual tables. This app lets you pick an information "
+    "table based on a short preview, add details about the **accused** and/or the **case** from the project's two core tables, and download "
+    "everything as one CSV file. Your choices are processed in your browser and you can download them as a new CSV file for data cleaning and visualisation."
+)
+st.caption(f"Data source: GitHub repository {REPO}. This data set is based on: University of Edinburgh. School of History, Classics and Archaeology. (2010). Survey of Scottish Witchcraft, 1563 - 1736. Retrieved 16 November 2026, from https://find.data.gov.scot/datasets/33033 
+License: Creative Commons Attribution 4.0 International")
+
+# Show the list of tables
+if "sources" not in st.session_state:
+    try:
+        from pyodide.http import pyfetch
+
+        resp = await pyfetch(API_URL)
+        if resp.status != 200:
+            raise ValueError(f"GitHub answered HTTP {resp.status} (too many requests from this network?).")
+        items = await resp.json()
+        st.session_state["sources"] = {i["name"]: i["download_url"] for i in items if i["name"].lower().endswith(".csv")}
+        st.session_state["load_error"] = ""
+    except Exception as e:
+        st.session_state["sources"] = {}
+        st.session_state["load_error"] = str(e)
+
+sources = dict(st.session_state["sources"])
+if not sources:
+    st.warning(
+        "The list of tables could not be loaded from GitHub"
+        + (f" ({st.session_state['load_error']})" if st.session_state["load_error"] else "")
+        + ". You can try again, or upload the CSV files yourself: the two core tables "
+        f"({ACCUSED_FILE}, {CASE_FILE}) and the information tables you need."
+    )
+    if st.button("Try again"):
+        del st.session_state["sources"]
+        st.rerun()
+    for up in st.file_uploader("Upload CSV files", type=["csv"], accept_multiple_files=True) or []:
+        sources[up.name] = up.getvalue()
+    if not sources:
+        st.stop()
+
+# Choose the information table
+st.subheader("1. Choose an information table")
+core = {ACCUSED_FILE, CASE_FILE}
+choices = sorted(n for n in sources if n not in core)
+if not choices:
+    st.info("Only the core tables are available. Upload at least one more table.")
+    st.stop()
+chosen = st.selectbox("Information table", choices)
+try:
+    table = await get_table(chosen, sources)
+except Exception as exc:
+    st.error(f"Could not read {chosen}: {exc}")
+    st.stop()
+st.caption(f"{chosen}: {len(table)} rows, {len(table.columns)} columns.")
+with st.expander("Preview"):
+    st.dataframe(table.head(20), use_container_width=True, hide_index=True)
+
+base_keep = st.multiselect(
+    "Columns of this table to keep in the export", list(table.columns), default=list(table.columns),
+    key=f"base_{chosen}",
+    help="IDs such as AccusedRef or CaseRef are still used for the merge even if you do not keep them.",
+)
+
+# Add information about the accused and/or the case
+st.subheader("2. Add information about the accused and/or the case")
+result, added, offered = table, [], False
+for label, filename, key, suffix in [
+    ("accused", ACCUSED_FILE, ACCUSED_KEY, "_accused"),
+    ("case", CASE_FILE, CASE_KEY, "_case"),
+]:
+    left_key = find_col(table, key)
+    via_case = False  # accused information reached indirectly: table -> CaseRef -> WDB_Case -> AccusedRef
+    if not left_key and label == "accused" and find_col(table, CASE_KEY) and CASE_FILE in sources:
+        try:
+            case_ref = await get_table(CASE_FILE, sources)
+            via_case = bool(find_col(case_ref, CASE_KEY) and find_col(case_ref, ACCUSED_KEY))
+        except Exception:
+            via_case = False
+    if not left_key and not via_case:
+        continue
+    offered = True
+    how = f"linked via {key}" if left_key else f"not linked directly, but found via {CASE_KEY} and {CASE_FILE}"
+    if not st.checkbox(f"Add information from {filename} ({how})", key=f"use_{label}_{chosen}", value=via_case):
+        continue
+    if filename not in sources:
+        st.error(f"{filename} is not available. Upload it above or check the settings.")
+        continue
+    try:
+        ref = await get_table(filename, sources)
+    except Exception as exc:
+        st.error(str(exc))
+        continue
+    right_key = find_col(ref, key)
+    if not right_key:
+        st.error(f"{filename} has no column called {key}, so the tables cannot be linked.")
+        continue
+    picked = st.multiselect(
+        f"Columns from {filename}", [c for c in ref.columns if c != right_key], key=f"cols_{label}_{chosen}"
+    )
+    if picked:
+        if via_case:  # first fetch each row's AccusedRef from the case table, use it for the merge, then drop it again
+            bridge = "_AccusedRef_via_case"
+            result, found, _, _ = add_columns(
+                result, case_ref, find_col(table, CASE_KEY), find_col(case_ref, CASE_KEY),
+                [find_col(case_ref, ACCUSED_KEY)], "_case",
+            )
+            left_key = bridge
+            result = result.rename(columns={found[0]: bridge})
+        result, new_columns, matched, duplicates = add_columns(result, ref, left_key, right_key, picked, suffix)
+        if via_case:
+            result = result.drop(columns=[bridge])
+        added += new_columns
+        st.caption(f"{matched} of {len(result)} rows found a match in {filename}.")
+        if duplicates:
+            st.warning(f"{duplicates} {key} values appear more than once in {filename}. Only the first one is used.")
+if not offered:
+    st.info(f"This table has neither an {ACCUSED_KEY} nor a {CASE_KEY} column, so nothing can be added from the core tables.")
+
+# Name and download new file
+st.subheader("3. Name your file and download it")
+final = result[base_keep + added]
+if final.empty or len(final.columns) == 0:
+    st.warning("Please keep at least one column.")
+    st.stop()
+name = st.text_input("File name", value=f"{chosen.rsplit('.', 1)[0]}_merged")
+filename = (re.sub(r"[^\w\-]+", "_", name).strip("_") or "export") + ".csv"
+st.caption(f"{len(final.columns)} columns, {len(final)} rows. First 20 rows:")
+st.dataframe(final.head(20), use_container_width=True, hide_index=True)
+st.download_button(
+    f"Download {filename}",
+    data=final.to_csv(index=False).encode("utf-8-sig"),  # BOM so tools like Excel read accents correctly
+    file_name=filename,
+    mime="text/csv",
+    type="primary",
+)
+  </script>
+
+  <script type="module">
+    import { mount } from "https://cdn.jsdelivr.net/npm/@stlite/browser@0.85.1/build/stlite.js";
+    mount(
+      {
+        entrypoint: "streamlit_app.py",
+        files: { "streamlit_app.py": document.getElementById("app-code").textContent },
+        streamlitConfig: {
+          "client.toolbarMode": "viewer",
+          "theme.primaryColor": "#1F4E79",
+        },
+      },
+      document.getElementById("root"),
+    );
+  </script>
+</body>
+</html>
